@@ -30,7 +30,17 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3, GLib, Gtk
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = Path.home() / ".codexbar" / "config.json"
+def _resolve_config_path() -> Path:
+    # New installs use ~/.config/codexbar/config.json; older installs still
+    # keep ~/.codexbar/config.json. Prefer the new path, fall back to legacy.
+    new_path = Path.home() / ".config" / "codexbar" / "config.json"
+    legacy_path = Path.home() / ".codexbar" / "config.json"
+    if new_path.exists():
+        return new_path
+    return legacy_path
+
+
+CONFIG_PATH = _resolve_config_path()
 ICON_NAME = "codexbar-icon"
 REFRESH_INTERVAL_SEC = int(os.environ.get("CODEXBAR_REFRESH_INTERVAL_SEC", "120"))
 FETCH_TIMEOUT_SEC = int(os.environ.get("CODEXBAR_FETCH_TIMEOUT_SEC", "120"))
