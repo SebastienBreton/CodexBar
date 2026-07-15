@@ -1,0 +1,36 @@
+name: Linux indicator
+
+on:
+  pull_request:
+    paths:
+      - "linux/**"
+      - ".github/workflows/linux-indicator.yml"
+  push:
+    branches: [main]
+    paths:
+      - "linux/**"
+      - ".github/workflows/linux-indicator.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile indicator
+        run: python -m py_compile linux/gnome-indicator/codexbar-indicator
+
+      - name: Lint indicator
+        run: |
+          python -m pip install --upgrade ruff
+          ruff check --select F linux/gnome-indicator/codexbar-indicator
+
+      - name: Shellcheck installer
+        run: shellcheck linux/gnome-indicator/install.sh
