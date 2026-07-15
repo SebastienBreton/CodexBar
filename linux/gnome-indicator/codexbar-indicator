@@ -1,0 +1,545 @@
+#!/usr/bin/python3
+"""CodexBar AppIndicator for GNOME / Ubuntu (and other AppIndicator desktops).
+
+Displays CodexBar usage in the desktop top bar using Ayatana AppIndicator.
+Usage data comes from the native `codexbar` CLI (the same Linux CLI shipped by
+upstream via Homebrew, the AUR, or the release tarballs); this indicator is a
+thin front-end over `codexbar usage --format json`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3, GLib, Gtk
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path.home() / ".codexbar" / "config.json"
+ICON_NAME = "codexbar-icon"
+REFRESH_INTERVAL_SEC = int(os.environ.get("CODEXBAR_REFRESH_INTERVAL_SEC", "120"))
+FETCH_TIMEOUT_SEC = int(os.environ.get("CODEXBAR_FETCH_TIMEOUT_SEC", "120"))
+
+SUPPORTED_PROVIDER_SOURCES: dict[str, str] = {
+    "codex": "cli",
+    "claude": "oauth",
+    "copilot": "api",
+    "gemini": "api",
+    "kiro": "cli",
+    "kilo": "auto",
+    "openrouter": "api",
+    "synthetic": "api",
+    "warp": "api",
+    "zai": "api",
+}
+
+DEFAULT_PROVIDERS = ["codex", "claude"]
+
+PROVIDER_LABELS = {
+    "codex": "Ox",
+    "claude": "Cl",
+    "copilot": "Gh",
+    "gemini": "Ge",
+    "kiro": "Ki",
+    "kilo": "Kl",
+    "openrouter": "Or",
+    "synthetic": "Sy",
+    "warp": "Wp",
+    "zai": "Za",
+}
+
+PROVIDER_NAMES = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "copilot": "Copilot",
+    "gemini": "Gemini",
+    "kiro": "Kiro",
+    "kilo": "Kilo",
+    "openrouter": "OpenRouter",
+    "synthetic": "Synthetic",
+    "warp": "Warp",
+    "zai": "z.ai",
+}
+
+WINDOW_TITLES = {
+    "primary": "Session",
+    "secondary": "Weekly",
+    "tertiary": "Monthly",
+}
+
+CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "CNY": "¥",
+}
+
+LABEL_GUIDE = "Ox100/100 Cl100/100"
+
+
+def resolve_codexbar_cli() -> str | None:
+    """Locate the native CodexBar CLI binary.
+
+    Resolution order: the ``CODEXBAR_CLI`` env override (a name on PATH or an
+    absolute path), then ``codexbar`` or ``CodexBarCLI`` on PATH. Returns
+    ``None`` when nothing usable is found.
+    """
+    override = os.environ.get("CODEXBAR_CLI")
+    if override:
+        return shutil.which(override) or (override if os.path.exists(override) else None)
+    for name in ("codexbar", "CodexBarCLI"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+CODEXBAR_CLI = resolve_codexbar_cli()
+
+CLI_NOT_FOUND_MESSAGE = (
+    "CodexBar CLI not found. Install the Linux CLI so that `codexbar` is on your "
+    "PATH (Homebrew, the AUR package `codexbar-cli`, or the "
+    "CodexBarCLI-*-linux-*.tar.gz release tarball), or point CODEXBAR_CLI at its "
+    "full path.\n"
+    "See https://github.com/steipete/codexbar#cli-tarballs-macoslinux"
+)
+
+
+@dataclass
+class FetchResult:
+    provider: str
+    payload: dict[str, Any]
+
+    @property
+    def error(self) -> dict[str, Any] | None:
+        error = self.payload.get("error")
+        return error if isinstance(error, dict) else None
+
+    @property
+    def usage(self) -> dict[str, Any]:
+        usage = self.payload.get("usage")
+        return usage if isinstance(usage, dict) else {}
+
+    @property
+    def credits(self) -> dict[str, Any]:
+        credits = self.payload.get("credits")
+        return credits if isinstance(credits, dict) else {}
+
+
+def load_enabled_providers() -> list[str]:
+    override = os.environ.get("CODEXBAR_INDICATOR_PROVIDERS")
+    if override:
+        requested = [item.strip() for item in override.split(",") if item.strip()]
+        filtered = [provider for provider in requested if provider in SUPPORTED_PROVIDER_SOURCES]
+        return filtered or DEFAULT_PROVIDERS.copy()
+
+    if not CONFIG_PATH.exists():
+        return DEFAULT_PROVIDERS.copy()
+
+    try:
+        config = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_PROVIDERS.copy()
+
+    providers = []
+    for entry in config.get("providers", []):
+        provider_id = entry.get("id")
+        if entry.get("enabled") and provider_id in SUPPORTED_PROVIDER_SOURCES:
+            providers.append(provider_id)
+
+    return providers or DEFAULT_PROVIDERS.copy()
+
+
+def decode_first_json_blob(text: str) -> Any | None:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def remaining_percent(window: dict[str, Any] | None) -> int | None:
+    if not isinstance(window, dict):
+        return None
+    used = window.get("usedPercent")
+    if used is None:
+        return None
+    try:
+        value = 100 - round(float(used))
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(100, int(value)))
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def format_local_timestamp(value: Any) -> str | None:
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def format_provider_label(result: FetchResult) -> str:
+    prefix = PROVIDER_LABELS.get(result.provider, result.provider[:2].title())
+    if result.error:
+        return f"{prefix}!"
+
+    primary = remaining_percent(result.usage.get("primary"))
+    secondary = remaining_percent(result.usage.get("secondary"))
+    credits = result.credits.get("remaining")
+
+    if primary is not None and secondary is not None:
+        return f"{prefix}{primary:02d}/{secondary:02d}"
+    if primary is not None:
+        return f"{prefix}{primary:02d}"
+    if credits is not None:
+        try:
+            return f"{prefix}${float(credits):.0f}"
+        except (TypeError, ValueError):
+            return f"{prefix}${credits}"
+    return prefix
+
+
+def format_reset_text(window: dict[str, Any] | None) -> str:
+    if not isinstance(window, dict):
+        return "unknown"
+    local_reset = format_local_timestamp(window.get("resetsAt"))
+    if local_reset:
+        return local_reset
+    reset = window.get("resetDescription")
+    if reset:
+        return str(reset)
+    resets_at = window.get("resetsAt")
+    return str(resets_at) if resets_at else "unknown"
+
+
+def detail_lines(result: FetchResult) -> list[str]:
+    lines: list[str] = []
+    provider_name = PROVIDER_NAMES.get(result.provider, result.provider.capitalize())
+    source = result.payload.get("source", "?")
+    lines.append(f"{provider_name} ({source})")
+
+    if result.error:
+        lines.append(f"Error: {result.error.get('message', 'unknown error')}")
+        return lines
+
+    identity = result.usage.get("identity", {})
+    email = identity.get("accountEmail") or result.usage.get("accountEmail")
+    organization = identity.get("accountOrganization") or result.usage.get("accountOrganization")
+    login_method = identity.get("loginMethod") or result.usage.get("loginMethod")
+
+    for window_key in ("primary", "secondary", "tertiary"):
+        window = result.usage.get(window_key)
+        if not isinstance(window, dict):
+            continue
+        remaining = remaining_percent(window)
+        title = WINDOW_TITLES[window_key]
+        if remaining is None:
+            lines.append(f"{title}: unavailable")
+        else:
+            lines.append(f"{title}: {remaining}% left, resets {format_reset_text(window)}")
+
+    extra_windows = result.usage.get("extraRateWindows")
+    if isinstance(extra_windows, list):
+        for entry in extra_windows:
+            if not isinstance(entry, dict):
+                continue
+            window = entry.get("window")
+            if not isinstance(window, dict):
+                continue
+            title = entry.get("title") or entry.get("id") or "Extra"
+            remaining = remaining_percent(window)
+            if remaining is None:
+                lines.append(f"{title}: unavailable")
+            elif window.get("resetsAt") or window.get("resetDescription"):
+                lines.append(f"{title}: {remaining}% left, resets {format_reset_text(window)}")
+            else:
+                lines.append(f"{title}: {remaining}% left")
+
+    provider_cost = result.usage.get("providerCost")
+    if isinstance(provider_cost, dict):
+        used = provider_cost.get("used")
+        limit = provider_cost.get("limit")
+        currency = CURRENCY_SYMBOLS.get(provider_cost.get("currencyCode"), provider_cost.get("currencyCode") or "")
+        period = provider_cost.get("period") or "Extra usage"
+        if used is not None and limit is not None:
+            try:
+                lines.append(f"{period}: {currency}{float(used):.2f}/{currency}{float(limit):.2f}")
+            except (TypeError, ValueError):
+                lines.append(f"{period}: {currency}{used}/{currency}{limit}")
+        elif used is not None:
+            try:
+                lines.append(f"{period}: {currency}{float(used):.2f}")
+            except (TypeError, ValueError):
+                lines.append(f"{period}: {currency}{used}")
+
+    credits_remaining = result.credits.get("remaining")
+    if credits_remaining is not None:
+        lines.append(f"Credits: {credits_remaining}")
+    if login_method:
+        lines.append(f"Plan/Login: {login_method}")
+    if email:
+        lines.append(f"Account: {email}")
+    if organization:
+        lines.append(f"Org: {organization}")
+
+    updated_at = result.usage.get("updatedAt") or result.credits.get("updatedAt")
+    local_updated_at = format_local_timestamp(updated_at)
+    if local_updated_at:
+        lines.append(f"Updated: {local_updated_at}")
+    elif updated_at:
+        lines.append(f"Updated: {updated_at}")
+
+    return lines
+
+
+def fetch_provider(provider: str) -> FetchResult:
+    command = [
+        str(CODEXBAR_CLI),
+        "usage",
+        "--provider",
+        provider,
+        "--format",
+        "json",
+        "--json-only",
+    ]
+
+    source = SUPPORTED_PROVIDER_SOURCES.get(provider)
+    if source:
+        command.extend(["--source", source])
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=FETCH_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return FetchResult(
+            provider=provider,
+            payload={
+                "provider": provider,
+                "source": source or "auto",
+                "error": {"message": f"Timed out after {FETCH_TIMEOUT_SEC}s"},
+            },
+        )
+    except OSError as exc:
+        return FetchResult(
+            provider=provider,
+            payload={
+                "provider": provider,
+                "source": source or "auto",
+                "error": {"message": str(exc)},
+            },
+        )
+
+    payload = decode_first_json_blob(completed.stdout) or decode_first_json_blob(completed.stderr)
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            first.setdefault("provider", provider)
+            return FetchResult(provider=provider, payload=first)
+
+    if isinstance(payload, dict):
+        payload.setdefault("provider", provider)
+        return FetchResult(provider=provider, payload=payload)
+
+    stderr = completed.stderr.strip()
+    stdout = completed.stdout.strip()
+    message = stderr or stdout or f"CodexBar fetch failed with exit code {completed.returncode}"
+    return FetchResult(
+        provider=provider,
+        payload={
+            "provider": provider,
+            "source": source or "auto",
+            "error": {"message": message},
+        },
+    )
+
+
+def fetch_all(providers: list[str]) -> list[FetchResult]:
+    return [fetch_provider(provider) for provider in providers]
+
+
+class CodexBarIndicator:
+    def __init__(self, providers: list[str]):
+        self.providers = providers
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "codexbar-ubuntu-indicator",
+            ICON_NAME,
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_icon_theme_path(str(SCRIPT_DIR))
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("CodexBar")
+
+        self.last_results: list[FetchResult] = []
+        self.last_refresh_at: str | None = None
+        self._stop_event = threading.Event()
+
+        self._rebuild_menu()
+        self._set_indicator_label("Loading...")
+        self._start_polling()
+
+    def _set_indicator_label(self, label: str) -> None:
+        self.indicator.set_label(label, LABEL_GUIDE)
+
+    def _build_label(self) -> str:
+        if not self.last_results:
+            return "CodexBar"
+        return " ".join(format_provider_label(result) for result in self.last_results)
+
+    def _rebuild_menu(self) -> None:
+        menu = Gtk.Menu()
+
+        title_item = Gtk.MenuItem(label="CodexBar Ubuntu Indicator")
+        title_item.set_sensitive(False)
+        menu.append(title_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        if not self.last_results:
+            placeholder = Gtk.MenuItem(label="Loading usage data...")
+            placeholder.set_sensitive(False)
+            menu.append(placeholder)
+        else:
+            for index, result in enumerate(self.last_results):
+                for line in detail_lines(result):
+                    item = Gtk.MenuItem(label=line)
+                    item.set_sensitive(False)
+                    menu.append(item)
+                if index != len(self.last_results) - 1:
+                    menu.append(Gtk.SeparatorMenuItem())
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        refreshed_label = f"Last refresh: {self.last_refresh_at}" if self.last_refresh_at else "Last refresh: pending"
+        refreshed_item = Gtk.MenuItem(label=refreshed_label)
+        refreshed_item.set_sensitive(False)
+        menu.append(refreshed_item)
+
+        refresh_item = Gtk.MenuItem(label="Refresh now")
+        refresh_item.connect("activate", self._on_refresh)
+        menu.append(refresh_item)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit)
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.menu = menu
+        self.indicator.set_menu(menu)
+
+    def _fetch_and_publish(self) -> None:
+        results = fetch_all(self.providers)
+        GLib.idle_add(self._apply_results, results)
+
+    def _apply_results(self, results: list[FetchResult]) -> bool:
+        self.last_results = results
+        self.last_refresh_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._set_indicator_label(self._build_label())
+        self._rebuild_menu()
+        return False
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._fetch_and_publish()
+            self._stop_event.wait(REFRESH_INTERVAL_SEC)
+
+    def _start_polling(self) -> None:
+        thread = threading.Thread(target=self._poll_loop, daemon=True)
+        thread.start()
+
+    def _on_refresh(self, _widget: Gtk.MenuItem) -> None:
+        self._set_indicator_label("Refreshing...")
+        thread = threading.Thread(target=self._fetch_and_publish, daemon=True)
+        thread.start()
+
+    def _on_quit(self, _widget: Gtk.MenuItem) -> None:
+        self.shutdown()
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        Gtk.main_quit()
+
+
+def print_once(providers: list[str]) -> int:
+    results = fetch_all(providers)
+    label = " ".join(format_provider_label(result) for result in results)
+    print(label)
+    for result in results:
+        for line in detail_lines(result):
+            print(line)
+    return 0 if any(not result.error for result in results) else 1
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CodexBar Ubuntu AppIndicator")
+    parser.add_argument("--once", action="store_true", help="Fetch once, print the label/menu data, then exit")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if CODEXBAR_CLI is None:
+        print(CLI_NOT_FOUND_MESSAGE, file=sys.stderr)
+        return 1
+
+    providers = load_enabled_providers()
+
+    if args.once:
+        return print_once(providers)
+
+    indicator_holder: dict[str, CodexBarIndicator] = {}
+
+    def handle_exit(_signum: int, _frame: Any) -> None:
+        indicator = indicator_holder.get("indicator")
+        if indicator is not None:
+            indicator.shutdown()
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    indicator_holder["indicator"] = CodexBarIndicator(providers)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
