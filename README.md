@@ -237,6 +237,7 @@ CLI install:
 - [Win-CodexBar](https://github.com/Finesssee/Win-CodexBar)
 
 ## Linux desktop integration?
+- [Bundled GNOME/Ubuntu indicator](linux/gnome-indicator) — first-party Ayatana AppIndicator tray for the GNOME/Ubuntu (and KDE/XFCE/MATE/Cinnamon) top bar, built on top of the bundled Linux CLI. Ships in this repo; run `linux/gnome-indicator/install.sh`.
 - [codexbar-waybar](https://github.com/Marouan-chak/codexbar-waybar) — Waybar custom module + GTK4 popover for Hyprland / Sway / other Wayland compositors, built on top of the bundled Linux CLI.
 - [Codexbar GNOME](https://extensions.gnome.org/extension/9841/codexbar/) — GNOME Shell extension that brings CodexBar usage into the desktop panel.
 - [codexbar-cinnamon-applet](https://github.com/jacobcalvert/codexbar-cinnamon-applet) — Linux Mint Cinnamon panel applet powered by CodexBar's JSON output.
