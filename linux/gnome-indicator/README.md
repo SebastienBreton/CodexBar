@@ -51,7 +51,8 @@ autostart entry so it comes back on login, and starts it for the current session
 ## Configuration
 
 The indicator honors the providers you enabled in the CodexBar app
-(`~/.codexbar/config.json`). Environment variables override the defaults:
+(`~/.config/codexbar/config.json`, or the legacy `~/.codexbar/config.json`).
+Environment variables override the defaults:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
